@@ -1,247 +1,276 @@
-"""
-FastAPI application — REST + WhatsApp webhook entrypoint.
+"""Medic.ai — AI Medical Record Assistant for Indonesia.
 
-Endpoints:
-  POST /chat          — REST API (Playground / web UI)
-  POST /webhook/whatsapp — Twilio inbound webhook
-  GET  /health        — Health check
-  GET  /records       — List all records (paginated)
+End-to-end pipeline:
+WhatsApp/REST -> Extractor -> Validator -> Preview -> explicit confirmation -> Sheets -> Chroma memory.
+The application never invents missing clinical facts and never writes without confirmation.
 """
-
 from __future__ import annotations
 
+import hashlib
+import hmac
+import json
 import os
-from contextlib import asynccontextmanager
-from typing import Optional
+import re
+from datetime import datetime
+from typing import Any
+from zoneinfo import ZoneInfo
 
+import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Form, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, PlainTextResponse
-from loguru import logger
+from fastapi.responses import PlainTextResponse
 from openai import AsyncOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from src.agents.extractor import ExtractorAgent
-from src.agents.validator import ValidatorAgent
-from src.agents.writer import WriterAgent
-from src.models.medical_record import ExtractedRecord, MedicalRecord
-from src.orchestrator import MedicalRecordOrchestrator
-from src.services.memory import MemoryService
-from src.services.record_id import RecordIDService
-from src.services.sheets import SheetsService
-from src.services.whatsapp import WhatsAppService
+from agents.validator import validate_record
+from memory.chroma_store import ChromaPatientHistory
+from tools.generate_medical_record_id import generate_medical_record_id
 
 load_dotenv()
 
-# ── In-memory pending sessions (keyed by sender phone number) ─────────────────
-# In production, replace with Redis or a persistent store.
-_PENDING: dict[str, ExtractedRecord] = {}
+TZ = ZoneInfo(os.getenv("TIMEZONE", "Asia/Jakarta"))
+HEADERS = [
+    "Medical Record ID", "Patient Name", "Age", "Gender", "Chief Complaint",
+    "Symptoms", "Visit Date", "Diagnosis", "Treatment Plan", "Created Date",
+    "Last Updated Date", "Visit Type",
+]
+REQUIRED = ["Patient Name", "Age", "Gender", "Chief Complaint", "Symptoms", "Visit Date"]
 
-# ── Shared service instances ──────────────────────────────────────────────────
-_orchestrator: Optional[MedicalRecordOrchestrator] = None
-_whatsapp: Optional[WhatsAppService] = None
+app = FastAPI(title="Medic.ai", version="2.0.0", description="AI Medical Record Assistant")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")) if os.getenv("OPENAI_API_KEY") else None
+memory = ChromaPatientHistory(os.getenv("CHROMA_PERSIST_DIR", "./data/chroma"))
+PENDING: dict[str, dict[str, Any]] = {}
 
 
-def _build_orchestrator() -> MedicalRecordOrchestrator:
-    openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+def now() -> datetime:
+    return datetime.now(TZ)
 
-    sheets = SheetsService(
-        spreadsheet_id=os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", ""),
-        sheet_name=os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Sheet1"),
-        service_account_file=os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE"),
+
+def normalize_gender(value: Any) -> Any:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    return {"l": "Laki-laki", "lk": "Laki-laki", "male": "Laki-laki", "pria": "Laki-laki",
+            "p": "Perempuan", "female": "Perempuan", "wanita": "Perempuan"}.get(s, value)
+
+
+def normalize_date(value: Any) -> Any:
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+    return value
+
+
+def parse_json(text: str) -> dict[str, Any]:
+    text = text.strip().replace("```json", "").replace("```", "").strip()
+    match = re.search(r"\{.*\}", text, re.S)
+    if not match:
+        raise ValueError("Extractor did not return JSON")
+    data = json.loads(match.group(0))
+    return {k: data.get(k) for k in ["Patient Name", "Age", "Gender", "Chief Complaint", "Symptoms", "Visit Date", "Diagnosis", "Treatment Plan", "Visit Type"]}
+
+
+async def extract(text: str) -> dict[str, Any]:
+    if not client:
+        raise RuntimeError("OPENAI_API_KEY belum dikonfigurasi")
+    prompt = """Anda adalah Extractor Agent Medic.ai. Ekstrak HANYA fakta yang disebutkan eksplisit dalam pesan pengguna. Jangan mendiagnosis, menyimpulkan, menebak, atau mengambil data lama untuk mengisi data baru. Kembalikan JSON valid saja. Field: Patient Name, Age, Gender, Chief Complaint, Symptoms, Visit Date, Diagnosis, Treatment Plan, Visit Type. Field yang tidak disebutkan wajib null."""
+    response = await client.chat.completions.create(
+        model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[{"role": "system", "content": prompt}, {"role": "user", "content": text}],
     )
-
-    record_id_svc = RecordIDService(sheets)
-    memory = MemoryService(persist_dir=os.getenv("CHROMA_PERSIST_DIR", "./data/chroma"))
-
-    extractor = ExtractorAgent(client=openai_client, model="gpt-4o")
-    validator = ValidatorAgent()
-    writer = WriterAgent(sheets=sheets, record_id=record_id_svc)
-
-    return MedicalRecordOrchestrator(
-        extractor=extractor,
-        validator=validator,
-        writer=writer,
-        memory=memory,
-        timezone=os.getenv("TIMEZONE", "Asia/Jakarta"),
-    )
+    return parse_json(response.choices[0].message.content or "{}")
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global _orchestrator, _whatsapp
-
-    logger.info("Starting Rekam Medis AI...")
-    _orchestrator = _build_orchestrator()
-    _whatsapp = WhatsAppService()
-
-    # Ensure Sheets has header row
-    from src.models.medical_record import MedicalRecord as MR
-    await _orchestrator.writer.sheets.ensure_headers(MR.sheets_headers())
-
-    logger.info("✅ Rekam Medis AI ready")
-    yield
-    logger.info("Shutting down...")
+def standardize(record: dict[str, Any]) -> dict[str, Any]:
+    record = dict(record)
+    record["Gender"] = normalize_gender(record.get("Gender"))
+    record["Visit Date"] = normalize_date(record.get("Visit Date"))
+    if record.get("Visit Type"):
+        record["Visit Type"] = str(record["Visit Type"]).strip().title()
+    return validate_record(record)
 
 
-# ── App ───────────────────────────────────────────────────────────────────────
-app = FastAPI(
-    title="Rekam Medis AI",
-    version="1.0.0",
-    description="AI Medical Record Assistant — Extract, Validate, Store",
-    lifespan=lifespan,
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def preview(record: dict[str, Any]) -> str:
+    labels = ["Patient Name", "Age", "Gender", "Chief Complaint", "Symptoms", "Visit Date", "Diagnosis", "Treatment Plan", "Visit Type"]
+    lines = ["📋 *PREVIEW REKAM MEDIS*", ""]
+    for key in labels:
+        value = record.get(key) if record.get(key) not in (None, "") else "—"
+        lines.append(f"• {key}: {value}")
+    lines.append("")
+    lines.append("Apakah data ini sudah benar dan siap disimpan? *YA/TIDAK*")
+    return "\n".join(lines)
 
 
-# ── REST: Chat endpoint ───────────────────────────────────────────────────────
+def _sheet():
+    import gspread
+    from google.oauth2.service_account import Credentials
+    credentials_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "service-account.json")
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(credentials_file, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(os.environ["GOOGLE_SHEETS_ID"])
+    return sh.worksheet(os.getenv("GOOGLE_SHEETS_SHEET_NAME", "Sheet1"))
+
+
+def ensure_headers(ws):
+    current = ws.row_values(1)
+    if current != HEADERS:
+        if current and current != HEADERS:
+            raise RuntimeError("Struktur kolom Google Sheets tidak sesuai schema A-L; tidak diubah otomatis.")
+        ws.update("A1:L1", [HEADERS])
+
+
+def save_record(record: dict[str, Any]) -> dict[str, Any]:
+    ws = _sheet()
+    ensure_headers(ws)
+    rows = ws.get_all_values()[1:]
+    today = now().strftime("%Y-%m-%d")
+    existing_ids = [r[0] for r in rows if r]
+    record_id = generate_medical_record_id(now().date(), existing_ids)
+    # Deterministic retry: if a collision exists, advance until unique.
+    while record_id in existing_ids:
+        suffix = int(record_id.rsplit("-", 1)[1]) + 1
+        record_id = f"MR-{today.replace('-', '')}-{suffix:03d}"
+    record = dict(record)
+    record["Medical Record ID"] = record_id
+    record["Created Date"] = now().isoformat()
+    record["Last Updated Date"] = now().isoformat()
+    ws.append_row([record.get(h, "") or "" for h in HEADERS], value_input_option="USER_ENTERED")
+    try:
+        memory.upsert(record)
+    except Exception:
+        # Sheets is the source of truth; memory failure must not duplicate the write.
+        pass
+    return record
+
+
+async def process(session_id: str, text: str, confirm: bool = False) -> dict[str, Any]:
+    if confirm:
+        pending = PENDING.pop(session_id, None)
+        if not pending:
+            return {"status": "no_pending", "message": "Tidak ada data yang menunggu konfirmasi."}
+        record = save_record(pending)
+        return {"status": "saved", "record": record, "message": f"✅ Rekam medis {record['Medical Record ID']} berhasil disimpan."}
+
+    extracted = standardize(await extract(text))
+    if extracted["status_data"] != "Lengkap":
+        missing = ", ".join(extracted["problem_fields"])
+        return {"status": "incomplete", "message": f"Data belum lengkap. Mohon lengkapi: {missing}.", "record": extracted}
+
+    history = []
+    if extracted.get("Patient Name"):
+        try:
+            history = memory.search(patient_name=str(extracted["Patient Name"]), n_results=5)
+        except Exception:
+            history = []
+    PENDING[session_id] = {k: extracted.get(k) for k in ["Patient Name", "Age", "Gender", "Chief Complaint", "Symptoms", "Visit Date", "Diagnosis", "Treatment Plan", "Visit Type"]}
+    history_text = ""
+    if history:
+        history_text = "\n\n📚 *Riwayat pasien (read-only, bukan data kunjungan baru):*\n" + "\n".join(f"• {x['document']}" for x in history[:5])
+    return {"status": "preview", "message": preview(extracted) + history_text, "record": extracted}
+
 
 class ChatRequest(BaseModel):
-    message: str
-    session_id: Optional[str] = None
+    message: str = Field(min_length=1)
+    session_id: str = "web"
     confirm: bool = False
 
 
-class ChatResponse(BaseModel):
-    success: bool
-    status: str
-    message: str
-    record_id: Optional[str] = None
-    preview: Optional[str] = None
+@app.get("/health")
+async def health():
+    return {"status": "ok", "service": "medic.ai", "version": "2.0.0"}
 
 
-@app.post("/chat", response_model=ChatResponse)
+@app.post("/chat")
 async def chat(req: ChatRequest):
-    """
-    REST endpoint for web/playground interaction.
-
-    - Send message → get preview
-    - Send confirm=true with same session_id → save record
-    """
-    if _orchestrator is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
-
-    pending = _PENDING.get(req.session_id) if req.session_id else None
-
-    result = await _orchestrator.process(
-        user_input=req.message,
-        confirm=req.confirm,
-        pending_extracted=pending if req.confirm else None,
-    )
-
-    # Store pending extraction for confirmation flow
-    if result.message == "preview" and req.session_id and result.extracted:
-        _PENDING[req.session_id] = result.extracted
-    elif req.session_id and req.session_id in _PENDING:
-        del _PENDING[req.session_id]
-
-    return ChatResponse(
-        success=result.success,
-        status=result.status.value,
-        message=result.message if result.message != "preview" else result.preview or "",
-        record_id=result.record.medical_record_id if result.record else None,
-        preview=result.preview,
-    )
+    try:
+        return await process(req.session_id, req.message, req.confirm)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-# ── WhatsApp Webhook ──────────────────────────────────────────────────────────
+def authorized(sender: str) -> bool:
+    allowed = {x.strip() for x in os.getenv("AUTHORIZED_PHONE_NUMBERS", "").split(",") if x.strip()}
+    return not allowed or sender in allowed
+
+
+def valid_signature(raw: bytes, signature: str | None) -> bool:
+    secret = os.getenv("WHATSAPP_APP_SECRET")
+    if not secret:
+        return True
+    if not signature or not signature.startswith("sha256="):
+        return False
+    expected = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature[7:], expected)
+
+
+async def send_whatsapp(to: str, text: str):
+    token = os.getenv("WHATSAPP_BUSINESS_TOKEN")
+    phone_id = os.getenv("WHATSAPP_PHONE_NUMBER_ID")
+    version = os.getenv("WHATSAPP_API_VERSION", "v23.0")
+    if not token or not phone_id:
+        raise RuntimeError("WhatsApp credentials belum dikonfigurasi")
+    url = f"https://graph.facebook.com/{version}/{phone_id}/messages"
+    payload = {"messaging_product": "whatsapp", "to": to, "type": "text", "text": {"body": text}}
+    async with httpx.AsyncClient(timeout=20) as http:
+        r = await http.post(url, headers={"Authorization": f"Bearer {token}"}, json=payload)
+        r.raise_for_status()
+
+
+@app.get("/webhook/whatsapp")
+async def whatsapp_verify(request: Request):
+    q = request.query_params
+    if q.get("hub.mode") == "subscribe" and q.get("hub.verify_token") == os.getenv("WHATSAPP_VERIFY_TOKEN"):
+        return PlainTextResponse(q.get("hub.challenge", ""))
+    raise HTTPException(status_code=403, detail="Webhook verification failed")
+
 
 @app.post("/webhook/whatsapp")
 async def whatsapp_webhook(request: Request):
-    """
-    Twilio inbound WhatsApp webhook.
+    raw = await request.body()
+    if not valid_signature(raw, request.headers.get("x-hub-signature-256")):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    body = json.loads(raw or b"{}")
+    for entry in body.get("entry", []):
+        for change in entry.get("changes", []):
+            for msg in change.get("value", {}).get("messages", []):
+                sender = msg.get("from")
+                text = msg.get("text", {}).get("body", "")
+                if not sender or not text:
+                    continue
+                if not authorized(sender):
+                    await send_whatsapp(sender, "Nomor ini belum terdaftar sebagai pengguna Medic.ai yang berwenang.")
+                    continue
+                sid = f"wa:{sender}"
+                upper = text.strip().upper()
+                result = await process(sid, "" if upper in {"YA", "YES", "Y"} else text, upper in {"YA", "YES", "Y"})
+                if upper in {"TIDAK", "NO", "N", "BATAL", "CANCEL"}:
+                    PENDING.pop(sid, None)
+                    reply = "❌ Rekam medis dibatalkan. Silakan kirim ulang data pasien."
+                else:
+                    reply = result.get("message", "Terjadi kesalahan.")
+                await send_whatsapp(sender, reply)
+    return {"ok": True}
 
-    Flow:
-    1. User sends patient info → system replies with preview
-    2. User replies YA → record saved
-    3. User replies TIDAK → cancelled
-    """
-    if _orchestrator is None or _whatsapp is None:
-        return PlainTextResponse("Service not ready", status_code=503)
-
-    form = await request.form()
-    inbound = WhatsAppService.parse_inbound(dict(form))
-    sender = inbound["from"]
-    body = inbound["body"]
-
-    logger.info(f"[WhatsApp] From {sender}: {body[:80]}")
-
-    # ── Handle confirmation ────────────────────────────────────────────────
-    if body.upper() in ("YA", "YES", "Y") and sender in _PENDING:
-        result = await _orchestrator.process(
-            user_input="",
-            confirm=True,
-            pending_extracted=_PENDING.pop(sender),
-        )
-        if result.success and result.record:
-            _whatsapp.send_confirmation(sender, result.record)
-        else:
-            _whatsapp.send(sender, result.message)
-        return PlainTextResponse("OK")
-
-    if body.upper() in ("TIDAK", "NO", "N", "CANCEL", "BATAL"):
-        _PENDING.pop(sender, None)
-        _whatsapp.send(sender, "❌ Rekam medis dibatalkan. Silakan kirim ulang data pasien.")
-        return PlainTextResponse("OK")
-
-    # ── New input ──────────────────────────────────────────────────────────
-    result = await _orchestrator.process(user_input=body, confirm=False)
-
-    if result.message == "preview" and result.extracted:
-        _PENDING[sender] = result.extracted
-        _whatsapp.send(sender, result.preview or "")
-
-    elif not result.success and result.validation:
-        if result.validation.missing_fields:
-            _whatsapp.send_missing_fields(sender, result.validation.missing_fields)
-        else:
-            _whatsapp.send(sender, result.message)
-
-    else:
-        _whatsapp.send(sender, result.message)
-
-    return PlainTextResponse("OK")
-
-
-# ── Records endpoint ──────────────────────────────────────────────────────────
 
 @app.get("/records")
-async def list_records(limit: int = 50, offset: int = 0):
-    """Return all medical records from Sheets (paginated)."""
-    if _orchestrator is None:
-        raise HTTPException(status_code=503, detail="Service not ready")
+async def records(limit: int = 50):
+    ws = _sheet()
+    ensure_headers(ws)
+    rows = ws.get_all_values()
+    return {"total": max(0, len(rows) - 1), "records": [dict(zip(HEADERS, r)) for r in rows[1:limit + 1]]}
 
-    rows = await _orchestrator.writer.sheets.get_all_rows()
-    headers = MedicalRecord.sheets_headers()
-    paginated = rows[offset: offset + limit]
-
-    records = [dict(zip(headers, row)) for row in paginated]
-    return {"total": len(rows), "offset": offset, "limit": limit, "records": records}
-
-
-# ── Health check ──────────────────────────────────────────────────────────────
-
-@app.get("/health")
-async def health():
-    return {"status": "ok", "service": "rekam-medis-ai", "version": "1.0.0"}
-
-
-# ── Run ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host=os.getenv("APP_HOST", "0.0.0.0"),
-        port=int(os.getenv("APP_PORT", "8000")),
-        reload=False,
-        log_level=os.getenv("LOG_LEVEL", "info").lower(),
-    )
+    uvicorn.run("main:app", host=os.getenv("APP_HOST", "0.0.0.0"), port=int(os.getenv("APP_PORT", "8000")))
