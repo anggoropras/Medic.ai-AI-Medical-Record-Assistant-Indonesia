@@ -4,8 +4,8 @@ httpx
 pydantic
 pydantic-settings
 python-dotenv
-langchain
-langchain-openai
-chromadb
 openai
+chromadb
+gspread
+google-auth
 pytest
